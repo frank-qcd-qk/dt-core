@@ -1,28 +1,42 @@
+import yaml
 from collections import OrderedDict
 
+# Robotics fun
 import cv2
 import matplotlib
+import numpy as np
+from datetime import  datetime
+# Default
+import duckietown_utils as dtu
 
+# Segmentation Toolkit
 from duckietown_msgs.msg import Segment, SegmentList
 from duckietown_segmaps.draw_map_on_images import plot_map, predict_segments
 from duckietown_segmaps.maps import FRAME_AXLE, plot_map_and_segments, FRAME_GLOBAL
 from duckietown_segmaps.transformations import TransformationsInfo
-import duckietown_utils as dtu
+
+# Easy Algo
 from easy_algo import get_easy_algo_db
 from easy_node.utils.timing import ProcessingTimingStats, FakeContext
+
+# GPG
 from image_processing.calibration_utils import get_ground_projection
+# lane_filter
 from lane_filter.lane_filter import LaneFilterHistogram
+# line_detector
 from line_detector.line_detector import LineDetector
+# anti_instagram
 from image_processing.anti_instagram import AntiInstagram
+# localization
 from localization_templates import FAMILY_LOC_TEMPLATES
-import numpy as np
 
 
 @dtu.contract(ground_truth='SE2|None', image='array[HxWx3](uint8)')
 def run_pipeline(image,
                  all_details=False,
                  ground_truth=None,
-                 actual_map=None):
+                 actual_map=None,
+                 quick=False):
     """
         Image: numpy (H,W,3) == BGR
         Returns a dictionary, res with the following fields:
@@ -32,61 +46,92 @@ def run_pipeline(image,
         ground_truth = pose
     """
 
-
     print('backend: %s' % matplotlib.get_backend())
     print('fname: %s' % matplotlib.matplotlib_fname())
 
-    quick = False
-
+    # Verify Image
     dtu.check_isinstance(image, np.ndarray)
+    printWtime("Image check passed")
 
-    res = OrderedDict()
-    stats = OrderedDict()
+    # Initial Setup
     vehicle_name = dtu.get_current_robot_name()
+    res = OrderedDict()  # The image book that holds all the images
+    stats = OrderedDict()  # The stats book that holds all the statistics
+    # TODO: This is not a good way to specify all the configuration files... Need smarter way...
+    master_path = "/code/catkin_ws/src/dt-core/packages/"
+    gpg_config_path = master_path + "ground_projection/config/ground_projection_node/default.yaml"
+    line_detector_config_path = master_path + "line_detector/config/line_detector_node/default.yaml"
+    lane_filter_config_path = master_path + "lane_filter/config/lane_filter_node/default.yaml"
+    anti_instagram_config_path = master_path + "anti_instagram/config/anti_instagram_node/default.yaml"
+    printWtime("Record book initialization complete!")
 
-    res['Raw input image'] = image
+    # Object Initialization
+    # Ground Projection Init
+    # TODO: This is using a decrepted call. This need update for ente refactor
     gp = get_ground_projection(vehicle_name)
-    gpg = gp.get_ground_projection_geometry
+    gpg = gp.get_ground_projection_geometry()
+    with open(gpg_config_path) as file:
+        gpg_config = yaml.load(file, Loader=yaml.FullLoader)
+    printWtime("GPG load success!")
+
+    # Line detector Init
+    with open(line_detector_config_path) as file:
+        line_detector_config = yaml.load(file, Loader=yaml.FullLoader)
     line_detector = LineDetector()
-    lane_filter = LaneFilterHistogram(None)
-    print("pass lane_filter")
+    printWtime("line_detector load success!")
+
+    # Lane filter Init
+    with open(lane_filter_config_path) as file:
+        lane_filter_config = yaml.load(file, Loader=yaml.FullLoader)
+    lane_filter = LaneFilterHistogram(**lane_filter_config["lane_filter_histogram_configuration"])
+    printWtime("lane_filter load success!")
+
+    # AntiInstagram Init
+    with open(anti_instagram_config_path) as file:
+        anti_instagram_config = yaml.load(file, Loader=yaml.FullLoader)
     ai = AntiInstagram()
-    pts = ProcessingTimingStats()
-    pts.reset()
-    pts.received_message()
-    pts.decided_to_process()
+    printWtime("anti_instagram load success!")
 
-    with pts.phase('calculate AI transform'):
-        [lower,upper] = ai.calculate_color_balance_thresholds(image)
+    # Analysis tools
+    # pts = ProcessingTimingStats()
+    # pts.reset()
+    # pts.received_message()
+    # pts.decided_to_process()
+    # print("Analysis tool load success! ")
 
-    with pts.phase('apply AI transform'):
-        transformed = ai.apply_color_balance(lower,upper,image)
+    # Got Image
+    res['Raw_input_image'] = image
+    printWtime("Image load complete!")
+    # =====Anti Instagram===== #
+    [lower, upper] = ai.calculate_color_balance_thresholds(image, anti_instagram_config["output_scale"],
+                                                           anti_instagram_config["color_balance_scale"])
+    printWtime("Calculate AI Transform complete!")
+    transformed = ai.apply_color_balance(lower, upper, image)
+    printWtime("Apply AI Color balance complete!")
+    res['Balanced'] = transformed
+    printWtime(+"AI Complete! ")
+    # =====Anti Instagram===== #
 
-    with pts.phase('edge detection'):
-        # note: do not apply transform twice!
-        segment_list2 = image_prep.process(pts, image,
-                                           line_detector, transform=ai.apply_color_balance)
+    # =====Edge Detection===== #
 
-        if all_details:
+    segment_list2 = image_prep.process(pts, image,
+                                       line_detector, transform=ai.apply_color_balance)
+    res['resized and corrected'] = image_prep.image_corrected
 
-            res['resized and corrected'] = image_prep.image_corrected
 
     dtu.logger.debug('segment_list2: %s' % len(segment_list2.segments))
 
-    if all_details:
-        res['segments_on_image_input_transformed'] = \
+    res['segments_on_image_input_transformed'] = \
             vs_fancy_display(image_prep.image_cv, segment_list2)
 
-    if all_details:
-        res['segments_on_image_input_transformed_resized'] = \
+    res['segments_on_image_input_transformed_resized'] = \
             vs_fancy_display(image_prep.image_resized, segment_list2)
 
-    if all_details:
-        grid = get_grid(image.shape[:2])
-        res['grid'] = grid
-        res['grid_remapped'] = gpg.rectify(grid)
+    grid = get_grid(image.shape[:2])
+    res['grid'] = grid
+    res['grid_remapped'] = gpg.rectify(grid)
 
-#     res['difference between the two'] = res['image_input']*0.5 + res['image_input_rect']*0.5
+    res['difference between the two'] = res['image_input']*0.5 + res['image_input_rect']*0.5
 
     with pts.phase('rectify_segments'):
         segment_list2_rect = rectify_segments(gpg, segment_list2)
@@ -131,9 +176,9 @@ def run_pipeline(image,
 
     if all_details:
         if actual_map is not None:
-    #         sm_axle = tinfo.transform_map_to_frame(actual_map, FRAME_AXLE)
+            #         sm_axle = tinfo.transform_map_to_frame(actual_map, FRAME_AXLE)
             res['real'] = plot_map_and_segments(actual_map, tinfo, sg.segments, dpi=120,
-                                                 ground_truth=ground_truth)
+                                                ground_truth=ground_truth)
 
     with pts.phase('rectify'):
         rectified0 = gpg.rectify(image)
@@ -151,22 +196,22 @@ def run_pipeline(image,
     if not quick:
         with pts.phase('plot_map_and_segments'):
             res['model assumed for localization'] = plot_map_and_segments(assumed, tinfo, sg.segments, dpi=120,
-                                               ground_truth=ground_truth)
+                                                                          ground_truth=ground_truth)
 
     assumed_axle = tinfo.transform_map_to_frame(assumed, FRAME_AXLE)
 
     with pts.phase('plot_map reprojected'):
         res['map reprojected on image'] = plot_map(rectified, assumed_axle, gpg,
-                                               do_ground=False, do_horizon=True,
-                                               do_faces=False, do_faces_outline=True,
-                                               do_segments=False)
+                                                   do_ground=False, do_horizon=True,
+                                                   do_faces=False, do_faces_outline=True,
+                                                   do_segments=False)
 
     with pts.phase('quality computation'):
         predicted_segment_list_rectified = predict_segments(sm=assumed_axle, gpg=gpg)
         quality_res, quality_stats = judge_quality(image, segment_list2_rect, predicted_segment_list_rectified)
         res.update(quality_res)
 
-#     res['blurred']= cv2.medianBlur(image, 11)
+    #     res['blurred']= cv2.medianBlur(image, 11)
     stats['estimate'] = est
     stats.update(quality_stats)
 
@@ -178,7 +223,7 @@ def judge_quality(image, observed_segment_list, predicted_segment_list):
     res = OrderedDict()
     stats = OrderedDict()
 
-#     mask2gray = lambda x: (x * 255).clip(0, 255).astype('uint8')
+    #     mask2gray = lambda x: (x * 255).clip(0, 255).astype('uint8')
     H, W, _ = image.shape
     r = 1
     reason_shape = (H * r, W * r, 3)
@@ -209,9 +254,9 @@ def judge_quality(image, observed_segment_list, predicted_segment_list):
 
         ratio_explained = 1 - (np.sum(not_explained) / (np.sum(explained) + np.sum(not_explained) + 1))
         ratios.append(ratio_explained)
-#         res['predicted %s' % color] = mask2gray(predicted_mask)
-#         res['observed %s' % color] = mask2gray(observed_mask)
-#         res['explained %s = %d%%' % (color, ratio_explained*100)] = mask2gray(explained)
+    #         res['predicted %s' % color] = mask2gray(predicted_mask)
+    #         res['observed %s' % color] = mask2gray(observed_mask)
+    #         res['explained %s = %d%%' % (color, ratio_explained*100)] = mask2gray(explained)
 
     avg = np.mean(ratios)
 
@@ -228,7 +273,6 @@ def _draw_segment_list_on_image(mask, segment_list, width):
     shape = mask.shape[:2]
 
     for segment in segment_list.segments:
-
         p1 = segment.pixels_normalized[0]
         p2 = segment.pixels_normalized[1]
 
@@ -257,3 +301,6 @@ def get_grid(shape, L=32, col={0: (255, 0, 0), 1: (0, 255, 0)}):
             coli = (cx + cy) % 2
             res[i, j, :] = col[coli]
     return res
+
+def printWtime(msg):
+    print("["+datetime.now().strftime("%x @ %X.%f")+"] "+msg)
